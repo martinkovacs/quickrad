@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QuickRAD</title>
+    <style>
+        body {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            gap: 32px;
+            background-color: #0f0f11;
+            font-family: Arial, Helvetica, sans-serif;
+            color: white;
+            margin: 0;
+        }
+
+        p {
+            margin: 0;
+        }
+
+        .logo {
+            width: 256px;
+            height: auto;
+            margin-bottom: 32px;
+        }
+
+        .loading-bar {
+            position: relative;
+            width: 80%;
+            max-width: 800px;
+            height: 10px;
+            background-color: #27272a;
+            overflow: hidden;
+            border-radius: 5px;
+        }
+
+        .loading-bar .moving-bar {
+            position: absolute;
+            width: 20%;
+            height: 100%;
+            background-color: #EA580C;
+            border-radius: 5px;
+            animation: scroll 1.5s ease-in-out infinite;
+        }
+
+        @keyframes scroll {
+            0% {
+                transform: translateX(0%);
+            }
+            50% {
+                transform: translateX(400%);
+            }
+            100% {
+                transform: translateX(0%);
+            }
+        }
+    </style>
+</head>
+<body>
+    <img src="../assets/logo.png" alt="Logo" class="logo">
+    <div class="loading-bar">
+        <div class="moving-bar"></div>
+    </div>
+    <p id="install-progress"></p>
+    
+    <script src="./renderer.js"></script>
+</body>
+</html>

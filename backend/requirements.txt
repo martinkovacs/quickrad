@@ -1,0 +1,7 @@
+torch
+torchvision
+gradio
+numpy
+pillow
+pydicom
+ultralytics

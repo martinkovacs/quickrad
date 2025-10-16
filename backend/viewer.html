@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>DICOM Viewer</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background-color: #000;
+      }
+      #container {
+        display: flex;
+        height: 100%;
+        overflow: hidden;
+      }
+      #dicomImage {
+        flex: 1;
+        width: 100%;
+      }
+      #dicomSlider {
+        writing-mode: vertical-lr;
+        accent-color:  #F97215;
+      }
+    </style>
+    <script src="./js/cornerstone.min.js"></script>
+    <script src="./js/cornerstoneMath.min.js"></script>
+    <script src="./js/cornerstoneTools.min.js"></script>
+    <script src="./js/cornerstoneWADOImageLoader.min.js"></script>
+    <script src="./js/dicomParser.min.js"></script>
+  </head>
+  <body>
+    <div id="container">
+      <div id="dicomImage"></div>
+      <input type="range" id="dicomSlider" min="0" max="0" value="0">
+    </div>
+
+    <script>
+      cornerstoneWADOImageLoader.external.cornerstone = cornerstone;
+      cornerstoneWADOImageLoader.external.dicomParser = dicomParser;
+
+      cornerstoneTools.init({ touchEnabled: false });
+      const element = document.getElementById("dicomImage");
+      cornerstone.enable(element);
+      
+      // Brightness and Contrast tool
+      cornerstoneTools.addTool(cornerstoneTools.WwwcTool, { name: 'Wwwc' });
+      cornerstoneTools.setToolActiveForElement(element, 'Wwwc', { mouseButtonMask: 1 });
+
+      cornerstoneTools.addTool(cornerstoneTools.ZoomTool, {
+        configuration: {
+          invert: false,
+          minScale: 0.1,
+          maxScale: 10.0,
+        }
+      });
+      cornerstoneTools.setToolActive('Zoom', { mouseButtonMask: 2 })
+      
+      // Zoom tool
+      function getCursorPosition(event) {
+        const rect = element.getBoundingClientRect();
+        return {
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top,
+        };
+      }
+
+      function zoom(event, zoomIn, pivotPoint) {
+        let viewport = cornerstone.getViewport(element);
+
+        const zoomFactor = zoomIn ? 1.05 : 0.95;
+        const newScale = viewport.scale * zoomFactor;
+
+        viewport.translation.x += (pivotPoint.x - element.clientWidth / 2) * (1 - zoomFactor) / newScale
+        viewport.translation.y += (pivotPoint.y - element.clientHeight / 2) * (1 - zoomFactor) / newScale
+        viewport.scale = newScale;
+
+        cornerstone.setViewport(element, viewport);
+      }
+
+      // If Ctrl is held, zoom at cursor position.
+      // Otherwise, scroll through images.
+      element.addEventListener("wheel", function (e) {
+        e.preventDefault();
+        if (e.ctrlKey) {
+          zoom(e, e.deltaY < 0, getCursorPosition(e));
+        } else {
+          if (e.deltaY > 0 && currentImageIndex < imageIds.length - 1) {
+            currentImageIndex++;
+            displayCurrentImage();
+          } else if (e.deltaY < 0 && currentImageIndex > 0) {
+            currentImageIndex--;
+            displayCurrentImage();
+          }
+        }
+      });
+
+      // Pan tool
+      cornerstoneTools.addTool(cornerstoneTools.PanTool)
+      cornerstoneTools.setToolActive('Pan', { mouseButtonMask: 4 })
+      
+      // Reset viewport
+      function resetViewport() {
+        if (originalViewport) {
+          const currentImage = cornerstone.getImage(element);
+          const newViewport = cornerstone.getDefaultViewportForImage(element, currentImage);
+          cornerstone.setViewport(element, newViewport);
+        }
+      }
+
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          resetViewport();
+        }
+      });
+
+      element.addEventListener("dblclick", function () {
+        resetViewport();
+      });
+      
+
+      // File handling
+      let currentImageIndex = 0;
+      let imageIds = [];
+      let originalViewport = null;
+
+      function displayCurrentImage() {
+        if (imageIds.length === 0) return;
+        const imageId = imageIds[currentImageIndex];
+
+        cornerstone.loadImage(imageId).then((image) => {
+          cornerstone.displayImage(element, image);
+
+          // Store a deep copy of the original viewport on first load
+          if (!originalViewport) {
+            originalViewport = JSON.parse(JSON.stringify(cornerstone.getDefaultViewportForImage(element, image)));
+          }
+
+          imageScroll.value = currentImageIndex;
+        });
+      }
+
+
+      currentImageIndex = 0;
+      imageIds = [];
+      const filePaths = []; // Replace this;
+      
+      async function loadFiles(paths) {
+        const files = [];
+        
+        for (const path of paths) {
+          const fileUrl = window.location.origin + '/gradio_api/file=' + encodeURIComponent(path);
+
+          const response = await fetch(fileUrl);
+          const blob = await response.blob();
+          const fileName = path.split('/').pop();
+          
+          const file = new File([blob], fileName, { type: 'application/dicom' });
+          
+          files.push(file);
+        }
+        
+        return files;
+      }
+      
+      const imageScroll = document.getElementById("dicomSlider");
+      imageScroll.addEventListener("input", function (e) {
+        currentImageIndex = parseInt(e.target.value, 10);
+        displayCurrentImage();
+      });
+
+      element.addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+      });
+
+      loadFiles(filePaths).then(files => {
+        for (const file of files) {
+          const imageId = cornerstoneWADOImageLoader.wadouri.fileManager.add(file);
+          imageIds.push(imageId);
+        }
+        
+        imageScroll.max = imageIds.length - 1;
+        imageScroll.value = 0;
+        
+        displayCurrentImage();
+      }).catch(error => {
+        console.error("Error loading DICOM files:", error);
+      });
+    </script>
+  </body>
+</html>
