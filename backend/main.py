@@ -5,16 +5,20 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 import pydicom
-from ultralytics import YOLO
+import torch
+from model import UNetCoordConv
 
 def get_path() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 PATH_SEPARATOR = "\\" if os.name == "nt" else "/"
 
-# model = YOLO(f"{get_path()}/yolo11n-seg-minirad.pt")
-s1_model = YOLO(f"{get_path()}/yolo11n-s1.pt")
-vds_model = YOLO(f"{get_path()}/yolo11m-vds.pt")
+# Initialize UNet model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = UNetCoordConv(n_channels=1, n_classes=20)
+model.load_state_dict(torch.load(f"{get_path()}/best_unet_model.pt", map_location=device))
+model.to(device)
+model.eval()
 
 css = """
 .tab-wrapper, footer, #prev_button, #next_button {
@@ -81,7 +85,8 @@ function() {
 }
 """
 
-def segment(dicom_paths: list[str], filter_processes=True, enable_deduplication=True):
+def segment(dicom_paths: list[str]):
+    print("HERE")
     start_time = time.time()
     if not dicom_paths:
         return [], None
@@ -90,13 +95,10 @@ def segment(dicom_paths: list[str], filter_processes=True, enable_deduplication=
         raise gr.Error("Please select a folder containing DICOM files only.")
 
     class_order = [
-        "S1", "L5/S1", "L5", "L4/L5", "L4", "L3/L4", "L3", "L2/L3", "L2", 
-        "L1/L2", "L1", "T12/L1", "T12", "T11/T12", "T11", "T10/T11", 
+        "S1", "L5/S1", "L5", "L4/L5", "L4", "L3/L4", "L3", "L2/L3", "L2",
+        "L1/L2", "L1", "T12/L1", "T12", "T11/T12", "T11", "T10/T11",
         "T10", "T9/T10", "T9", "spinal_canal"
     ]
-
-    vertebrae = [cls for cls in class_order if '/' not in cls and cls != 'spinal_canal']
-    discs = [cls for cls in class_order if '/' in cls]
 
     segmentation_results = []
 
@@ -104,247 +106,44 @@ def segment(dicom_paths: list[str], filter_processes=True, enable_deduplication=
         dicom_data = pydicom.dcmread(filename)
         pixel_array = dicom_data.pixel_array
 
-        if pixel_array.dtype != np.uint8:
+        # Normalize pixel array to 0-1 range for model input
+        if pixel_array.dtype != np.float32:
             pixel_array = pixel_array.astype(np.float32)
-            pixel_array = (pixel_array - np.min(pixel_array)) / (np.max(pixel_array) - np.min(pixel_array) + 1e-6)
-            pixel_array = (pixel_array * 255).astype(np.uint8)
+        pixel_array = (pixel_array - np.min(pixel_array)) / (np.max(pixel_array) - np.min(pixel_array) + 1e-6)
 
-        image = Image.fromarray(pixel_array).convert("L")
+        # Create PIL image for display (8-bit)
+        display_array = (pixel_array * 255).astype(np.uint8)
+        image = Image.fromarray(display_array).convert("L")
         original_shape = image.size
-        resized_image = image.resize((640, 640), Image.Resampling.LANCZOS)
 
-        s1_results = s1_model.predict(resized_image, verbose=False)
-        s1_center = None
-        s1_mask_obj = None  
+        # Resize image for model input
+        resized_image = Image.fromarray(pixel_array).resize((512, 512), Image.Resampling.LANCZOS)
 
-        for result in s1_results:
-            if result.masks and len(result.masks.data) > 0:
-                confidence_scores = result.boxes.conf.cpu().numpy()
-                class_ids = result.boxes.cls.cpu().numpy().astype(int)
+        # Convert to tensor and add batch and channel dimensions
+        input_tensor = torch.from_numpy(np.array(resized_image)).float().unsqueeze(0).unsqueeze(0)
+        input_tensor = input_tensor.to(device)
 
-                best_s1_idx = None
-                best_s1_conf = 0
+        # Run inference
+        with torch.no_grad():
+            output = model(input_tensor)
+            # Get class predictions (argmax over class dimension)
+            predictions = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
 
-                for i, (conf, class_id) in enumerate(zip(confidence_scores, class_ids)):
-                    class_name = s1_model.names[class_id]
-                    if conf > 0.1 and class_name.lower() == 's1':
-                        if conf > best_s1_conf:
-                            best_s1_conf = conf
-                            best_s1_idx = i
+        # Resize predictions back to original shape
+        predictions_resized = np.array(Image.fromarray(predictions.astype(np.uint8)).resize(
+            (original_shape[0], original_shape[1]),
+            Image.Resampling.NEAREST
+        ))
 
-                if best_s1_idx is not None:
-                    s1_mask = result.masks.data[best_s1_idx].cpu().numpy()
-
-                    y_coords, x_coords = np.where(s1_mask > 0.5)
-                    if len(y_coords) > 0:
-                        y_min, y_max = np.min(y_coords), np.max(y_coords)
-                        x_min, x_max = np.min(x_coords), np.max(x_coords)
-
-                        s1_center = ((y_min + y_max) / 2, (x_min + x_max) / 2)
-                        print(f"S1 center found at: {s1_center}")
-
-                        binary_mask = np.zeros((512, 512), dtype=np.float32)
-                        binary_mask[s1_mask > 0.5] = 1.0
-
-                        resized_s1_mask = np.array(Image.fromarray(binary_mask).resize(
-                            (original_shape[0], original_shape[1]), 
-                            Image.Resampling.NEAREST
-                        ))
-
-                        s1_mask_obj = {
-                            'mask': resized_s1_mask,
-                            'confidence': best_s1_conf,
-                            'class_type': 's1',
-                            'assigned_class': 'S1'
-                        }
-                break
-
-        if s1_center is None:
-            print("Warning: S1 vertebra not detected in this image")
-
-            segmentation_results.append((image, []))
-            continue
-
-        vertebra_disc_results = vds_model.predict(resized_image, verbose=False)
-
-        detected_objects = []
-        spinal_canal_objects = []
-        disc_masks = []  
-
-        for result in vertebra_disc_results:
-            masks = result.masks
-            confidence_scores = result.boxes.conf.cpu().numpy()
-            class_ids = result.boxes.cls.cpu().numpy().astype(int)
-
-            if masks and len(masks.data) > 0:
-                for i, (mask_tensor, conf, class_id) in enumerate(zip(masks.data, confidence_scores, class_ids)):
-                    if conf > 0.1:
-                        class_name = vds_model.names[class_id].lower()
-                        if class_name == 'disc':
-                            mask_array = mask_tensor.cpu().numpy()
-                            binary_mask = np.zeros((640, 640), dtype=np.float32)
-                            binary_mask[mask_array > 0.5] = 1.0
-
-                            resized_mask = np.array(Image.fromarray(binary_mask).resize(
-                                (original_shape[0], original_shape[1]), 
-                                Image.Resampling.NEAREST
-                            ))
-                            disc_masks.append(resized_mask)
-
-        def is_main_vertebra(mask, disc_masks, proximity_threshold=2):
-            """Filter vertebrae by checking if they touch or are close to disc masks"""
-            if not disc_masks:
-
-                return True
-
-            vertebra_coords = np.where(mask > 0.5)
-            if len(vertebra_coords[0]) == 0:
-                return False
-
-            vertebra_y, vertebra_x = vertebra_coords
-            vert_y_min, vert_y_max = np.min(vertebra_y), np.max(vertebra_y)
-            vert_x_min, vert_x_max = np.min(vertebra_x), np.max(vertebra_x)
-
-            for disc_mask in disc_masks:
-                disc_coords = np.where(disc_mask > 0.5)
-                if len(disc_coords[0]) == 0:
-                    continue
-
-                disc_y, disc_x = disc_coords
-                disc_y_min, disc_y_max = np.min(disc_y), np.max(disc_y)
-                disc_x_min, disc_x_max = np.min(disc_x), np.max(disc_x)
-
-                y_distance = max(0, max(vert_y_min - disc_y_max, disc_y_min - vert_y_max))
-                x_distance = max(0, max(vert_x_min - disc_x_max, disc_x_min - vert_x_max))
-
-                if max(y_distance, x_distance) <= proximity_threshold:
-                    return True
-
-            return False
-
-        for result in vertebra_disc_results:
-            masks = result.masks
-            confidence_scores = result.boxes.conf.cpu().numpy()
-            class_ids = result.boxes.cls.cpu().numpy().astype(int)
-
-            if masks and len(masks.data) > 0:
-                for i, (mask_tensor, conf, class_id) in enumerate(zip(masks.data, confidence_scores, class_ids)):
-                    if conf > 0.1:
-                        class_name = vds_model.names[class_id].lower()
-                        mask_array = mask_tensor.cpu().numpy()
-
-                        binary_mask = np.zeros((640, 640), dtype=np.float32)
-                        binary_mask[mask_array > 0.5] = 1.0
-
-                        resized_mask = np.array(Image.fromarray(binary_mask).resize(
-                            (original_shape[0], original_shape[1]), 
-                            Image.Resampling.NEAREST
-                        ))
-
-                        if class_name == 'spinal_canal':
-                            spinal_canal_objects.append({
-                                'mask': resized_mask,
-                                'confidence': conf,
-                                'class_type': class_name,
-                                'assigned_class': 'spinal_canal'
-                            })
-                            continue
-
-                        if filter_processes and class_name == 'vertebra':
-                            if not is_main_vertebra(resized_mask, disc_masks):
-                                print(f"Filtered out vertebra detection")
-                                continue
-
-                        y_coords, x_coords = np.where(resized_mask > 0.5)
-                        if len(y_coords) > 0:
-                            y_min, y_max = np.min(y_coords), np.max(y_coords)
-                            x_min, x_max = np.min(x_coords), np.max(x_coords)
-
-                            obj_center = ((y_min + y_max) / 2, (x_min + x_max) / 2)
-
-                            distance = np.sqrt((obj_center[0] - s1_center[0])**2 + 
-                                             (obj_center[1] - s1_center[1])**2)
-
-                            detected_objects.append({
-                                'mask': resized_mask,
-                                'confidence': conf,
-                                'class_type': class_name,  
-                                'center': obj_center,
-                                'distance_from_s1': distance,
-                                'random_id': np.random.randint(1000000)  
-                            })
-
-        filtered_objects = []
-
-        if enable_deduplication:
-
-            detected_objects.sort(key=lambda x: x['confidence'], reverse=True)
-
-            for obj in detected_objects:
-                should_keep = True
-
-                for kept_obj in filtered_objects:
-
-                    intersection = np.logical_and(obj['mask'] > 0, kept_obj['mask'] > 0)
-                    intersection_area = np.sum(intersection)
-
-                    union = np.logical_or(obj['mask'] > 0, kept_obj['mask'] > 0)
-                    union_area = np.sum(union)
-
-                    if union_area > 0:
-                        iou = intersection_area / union_area
-                        if iou > 0.7:
-                            should_keep = False
-                            break
-
-                if should_keep:
-                    filtered_objects.append(obj)
-        else:
-
-            filtered_objects = detected_objects
-
-        vertebra_objects = [obj for obj in filtered_objects if obj['class_type'].lower() == 'vertebra']
-        disc_objects = [obj for obj in filtered_objects if obj['class_type'].lower() == 'disc']
-
-        vertebra_objects.sort(key=lambda x: x['distance_from_s1'])
-        disc_objects.sort(key=lambda x: x['distance_from_s1'])
-        print([(obj.get("random_id"), obj.get("distance_from_s1"), obj.get("center")) for obj in vertebra_objects], flush=True)
-        print([(obj.get("random_id"), obj.get("distance_from_s1"), obj.get("center")) for obj in disc_objects], flush=True)
-
-        vertebra_idx = vertebrae.index('L5')  
-        for i, obj in enumerate(vertebra_objects):
-            if vertebra_idx + i < len(vertebrae):
-                obj['assigned_class'] = vertebrae[vertebra_idx + i]
-            else:
-
-                obj['assigned_class'] = None
-
-        disc_idx = discs.index('L5/S1')  
-        for i, obj in enumerate(disc_objects):
-            if disc_idx + i < len(discs):
-                obj['assigned_class'] = discs[disc_idx + i]
-            else:
-
-                obj['assigned_class'] = None
-
-        class_to_masks = {class_name: np.zeros((original_shape[1], original_shape[0]), dtype=np.float32)
-                         for class_name in class_order}
-
-        all_objects = [s1_mask_obj]
-        all_objects += filtered_objects + spinal_canal_objects
-
-        for obj in all_objects:
-            if obj.get('assigned_class'):
-                mask = obj['mask'] * 0.5  
-                class_to_masks[obj['assigned_class']] = np.maximum(
-                    class_to_masks[obj['assigned_class']], mask)
-                print(obj.get('assigned_class'), obj.get("random_id"), flush=True)
-
+        # Create masks for each class
         masks_and_classes = []
-        for class_name in class_order:
-            mask = class_to_masks[class_name]
-            if np.any(mask > 0):
-                masks_and_classes.append((mask, class_name))
+        for class_idx, class_name in enumerate(class_order):
+            # Create binary mask for this class
+            class_mask = (predictions_resized == class_idx).astype(np.float32) * 0.5
+
+            if np.any(class_mask > 0):
+                masks_and_classes.append((class_mask, class_name))
+                print(f"Found {class_name} in image")
 
         segmentation_results.append((image, masks_and_classes))
 
@@ -382,7 +181,7 @@ with gr.Blocks(css=css, js=js, title="QuickRAD") as demo:
             with gr.Row():
                 with gr.Column():
                     file_explorer = gr.File(file_count="directory", label="DICOM mappa kiválasztása")
-                    switch_button = gr.Button("Futtatás", variant="primary")
+                    switch_button = gr.Button("Futtatás")
                 with gr.Column():
                     dicom_viewer = gr.HTML(value=f"""<iframe id="dicom-iframe" style="width: 100%; height: calc(100vh - 52px); border: none;" src="gradio_api/file={get_path()}/viewer.html"></iframe>""", padding=False)
 
