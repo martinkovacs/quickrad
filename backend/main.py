@@ -6,19 +6,30 @@ import numpy as np
 from PIL import Image
 import pydicom
 import torch
+from scipy.ndimage import label
 from model import UNetCoordConv
+
 
 def get_path() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
+
 PATH_SEPARATOR = "\\" if os.name == "nt" else "/"
 
-# Initialize UNet model
+# Initialize UNet models
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = UNetCoordConv(n_channels=1, n_classes=20)
-model.load_state_dict(torch.load(f"{get_path()}/best_unet_model.pt", map_location=device))
-model.to(device)
-model.eval()
+
+# Spine model (L5-T9 vertebrae and discs)
+spine_model = UNetCoordConv(n_channels=1, n_classes=20)
+spine_model.load_state_dict(torch.load(f"{get_path()}/spine_model.pt", map_location=device))
+spine_model.to(device)
+spine_model.eval()
+
+# S1 model (S1 vertebra only)
+s1_model = UNetCoordConv(n_channels=1, n_classes=2)
+s1_model.load_state_dict(torch.load(f"{get_path()}/s1_model.pt", map_location=device))
+s1_model.to(device)
+s1_model.eval()
 
 css = """
 .tab-wrapper, footer, #prev_button, #next_button {
@@ -85,8 +96,53 @@ function() {
 }
 """
 
+def cleanup_segmentation(prediction, probabilities):
+    """
+    Cleans up a segmentation mask by merging small, incorrectly classified regions
+    based on class proximity and confidence.
+
+    Args:
+        prediction (np.ndarray): The initial segmentation mask (2D array of class indices).
+        probabilities (np.ndarray): The softmax probabilities for each class (3D array, C x H x W).
+
+    Returns:
+        np.ndarray: The cleaned-up segmentation mask.
+    """
+    cleaned_prediction = np.copy(prediction)
+
+    # Use scipy.ndimage.label for connected components
+    labeled_mask, num_features = label(prediction > 0)
+
+    for i in range(1, num_features + 1):
+        region_mask = (labeled_mask == i)
+        classes_in_region = np.unique(prediction[region_mask])
+
+        if len(classes_in_region) > 1:
+            # Check if classes are close enough to merge (and not background)
+            class_diff = np.max(classes_in_region) - np.min(classes_in_region)
+
+            if class_diff > 0 and class_diff <= 2:
+                # Calculate average confidence for each class in the region
+                avg_confidences = {}
+                for c in classes_in_region:
+                    if c == 0: continue # Skip background
+
+                    # Get the confidence of the specific class for the region
+                    class_probs = probabilities[c, :, :]
+                    avg_confidences[c] = np.mean(class_probs[region_mask])
+
+                if not avg_confidences: continue
+
+                # Find the class with the highest average confidence
+                dominant_class = max(avg_confidences, key=avg_confidences.get)
+
+                # Merge the region to the dominant class
+                cleaned_prediction[region_mask] = dominant_class
+
+    return cleaned_prediction
+
+
 def segment(dicom_paths: list[str]):
-    print("HERE")
     start_time = time.time()
     if not dicom_paths:
         return [], None
@@ -94,10 +150,20 @@ def segment(dicom_paths: list[str]):
     if [path for path in dicom_paths if not path.endswith(('.dcm', '.dicom'))]:
         raise gr.Error("Please select a folder containing DICOM files only.")
 
-    class_order = [
-        "S1", "L5/S1", "L5", "L4/L5", "L4", "L3/L4", "L3", "L2/L3", "L2",
-        "L1/L2", "L1", "T12/L1", "T12", "T11/T12", "T11", "T10/T11",
-        "T10", "T9/T10", "T9", "spinal_canal"
+    # Combined model class order after merging S1 and spine models
+    # Class 0 is background
+    # Classes 1-9 are from spine_model: L5, L4, L3, L2, L1, T12, T11, T10, T9
+    # Class 10 is S1 (from s1_model)
+    # Classes 11-19 are from spine_model: spinal_canal, L5/S1, L4/L5, L3/L4, L2/L3, L1/L2, T12/L1, T11/T12, T10/T11, T9/T10
+    model_class_order = [
+        "L5", "L4", "L3", "L2", "L1", "T12", "T11", "T10", "T9", "S1",
+        "spinal_canal", "L5/S1", "L4/L5", "L3/L4", "L2/L3", "L1/L2", "T12/L1", "T11/T12", "T10/T11", "T9/T10"
+    ]
+
+    # Desired display order
+    display_order = [
+        "S1", "L5/S1", "L5", "L4/L5", "L4", "L3/L4", "L3", "L2/L3", "L2", "L1/L2", "L1",
+        "T12/L1", "T12", "T11/T12", "T11", "T10/T11", "T10", "T9/T10", "T9", "spinal_canal"
     ]
 
     segmentation_results = []
@@ -123,11 +189,39 @@ def segment(dicom_paths: list[str]):
         input_tensor = torch.from_numpy(np.array(resized_image)).float().unsqueeze(0).unsqueeze(0)
         input_tensor = input_tensor.to(device)
 
-        # Run inference
+        # Run inference on both models
         with torch.no_grad():
-            output = model(input_tensor)
-            # Get class predictions (argmax over class dimension)
-            predictions = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
+            # Spine model prediction
+            spine_output = spine_model(input_tensor)
+            spine_probabilities = torch.softmax(spine_output, dim=1).squeeze(0).cpu().numpy()
+            spine_predictions = torch.argmax(spine_output, dim=1).squeeze(0).cpu().numpy()
+
+            # S1 model prediction (outputs class 10 for S1)
+            s1_output = s1_model(input_tensor)
+            s1_probabilities = torch.softmax(s1_output, dim=1).squeeze(0).cpu().numpy()
+            s1_predictions = torch.argmax(s1_output, dim=1).squeeze(0).cpu().numpy()
+
+        # Merge predictions: use S1 where predicted, otherwise use spine model
+        # S1 model outputs: 0 (background) or 1 (S1), we map 1 -> 10
+        predictions = spine_predictions.copy()
+        s1_mask = s1_predictions == 1
+        predictions[s1_mask] = 10
+
+        # Shift spine model's classes 10-19 to make room for S1 at position 10
+        high_class_mask = (spine_predictions >= 10) & (~s1_mask)
+        predictions[high_class_mask] = spine_predictions[high_class_mask] + 1
+
+        # Merge probabilities (21 classes total: background + 20 classes)
+        merged_probabilities = np.zeros((21, predictions.shape[0], predictions.shape[1]), dtype=np.float32)
+        # Classes 0-9 from spine model
+        merged_probabilities[0:10] = spine_probabilities[0:10]
+        # Class 10 from s1 model
+        merged_probabilities[10] = s1_probabilities[1]
+        # Classes 11-20 from spine model (shifted)
+        merged_probabilities[11:21] = spine_probabilities[10:20]
+
+        # Clean up small misclassified regions
+        predictions = cleanup_segmentation(predictions, merged_probabilities)
 
         # Resize predictions back to original shape
         predictions_resized = np.array(Image.fromarray(predictions.astype(np.uint8)).resize(
@@ -135,15 +229,21 @@ def segment(dicom_paths: list[str]):
             Image.Resampling.NEAREST
         ))
 
-        # Create masks for each class
-        masks_and_classes = []
-        for class_idx, class_name in enumerate(class_order):
+        # Create masks for each class (skip class 0 which is background)
+        masks_dict = {}
+        for class_idx, class_name in enumerate(model_class_order, start=1):
             # Create binary mask for this class
             class_mask = (predictions_resized == class_idx).astype(np.float32) * 0.5
 
             if np.any(class_mask > 0):
-                masks_and_classes.append((class_mask, class_name))
+                masks_dict[class_name] = class_mask
                 print(f"Found {class_name} in image")
+
+        # Reorder masks according to display_order
+        masks_and_classes = []
+        for class_name in display_order:
+            if class_name in masks_dict:
+                masks_and_classes.append((masks_dict[class_name], class_name))
 
         segmentation_results.append((image, masks_and_classes))
 

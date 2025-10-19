@@ -1,4 +1,5 @@
 # Python
+backend/__pycache__
 backend/python
 backend/venv
 viewer-iframe-*
