@@ -5,9 +5,8 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 import pydicom
-import torch
 from scipy.ndimage import label
-from model import UNetCoordConv
+import openvino as ov
 
 
 def get_path() -> str:
@@ -16,20 +15,29 @@ def get_path() -> str:
 
 PATH_SEPARATOR = "\\" if os.name == "nt" else "/"
 
-# Initialize UNet models
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Initialize OpenVINO
+core = ov.Core()
 
-# Spine model (L5-T9 vertebrae and discs)
-spine_model = UNetCoordConv(n_channels=1, n_classes=20)
-spine_model.load_state_dict(torch.load(f"{get_path()}/spine_model.pt", map_location=device))
-spine_model.to(device)
-spine_model.eval()
+# Detect available devices and prioritize GPU over CPU
+available_devices = core.available_devices
+device = "CPU"
+if "GPU" in available_devices:
+    device = "GPU"
+    print(f"Using GPU for inference")
+else:
+    print(f"GPU not available, using CPU for inference")
 
-# S1 model (S1 vertebra only)
-s1_model = UNetCoordConv(n_channels=1, n_classes=2)
-s1_model.load_state_dict(torch.load(f"{get_path()}/s1_model.pt", map_location=device))
-s1_model.to(device)
-s1_model.eval()
+# Load OpenVINO INT8 models
+spine_model_path = f"{get_path()}/spine_model/model_int8.xml"
+s1_model_path = f"{get_path()}/s1_model/model_int8.xml"
+
+# Compile models for the selected device
+spine_model = core.compile_model(spine_model_path, device)
+s1_model = core.compile_model(s1_model_path, device)
+
+# Get output layers for inference
+spine_output_layer = spine_model.output(0)
+s1_output_layer = s1_model.output(0)
 
 css = """
 .tab-wrapper, footer, #prev_button, #next_button {
@@ -185,21 +193,24 @@ def segment(dicom_paths: list[str]):
         # Resize image for model input
         resized_image = Image.fromarray(pixel_array).resize((512, 512), Image.Resampling.LANCZOS)
 
-        # Convert to tensor and add batch and channel dimensions
-        input_tensor = torch.from_numpy(np.array(resized_image)).float().unsqueeze(0).unsqueeze(0)
-        input_tensor = input_tensor.to(device)
+        # Convert to numpy array and add batch and channel dimensions
+        input_array = np.array(resized_image).astype(np.float32)
+        input_array = np.expand_dims(np.expand_dims(input_array, axis=0), axis=0)  # Shape: (1, 1, 512, 512)
 
         # Run inference on both models
-        with torch.no_grad():
-            # Spine model prediction
-            spine_output = spine_model(input_tensor)
-            spine_probabilities = torch.softmax(spine_output, dim=1).squeeze(0).cpu().numpy()
-            spine_predictions = torch.argmax(spine_output, dim=1).squeeze(0).cpu().numpy()
+        # Spine model prediction
+        spine_output = spine_model(input_array)[spine_output_layer]
+        # Apply softmax manually
+        spine_exp = np.exp(spine_output - np.max(spine_output, axis=1, keepdims=True))
+        spine_probabilities = (spine_exp / np.sum(spine_exp, axis=1, keepdims=True)).squeeze(0)
+        spine_predictions = np.argmax(spine_output, axis=1).squeeze(0)
 
-            # S1 model prediction (outputs class 10 for S1)
-            s1_output = s1_model(input_tensor)
-            s1_probabilities = torch.softmax(s1_output, dim=1).squeeze(0).cpu().numpy()
-            s1_predictions = torch.argmax(s1_output, dim=1).squeeze(0).cpu().numpy()
+        # S1 model prediction (outputs class 10 for S1)
+        s1_output = s1_model(input_array)[s1_output_layer]
+        # Apply softmax manually
+        s1_exp = np.exp(s1_output - np.max(s1_output, axis=1, keepdims=True))
+        s1_probabilities = (s1_exp / np.sum(s1_exp, axis=1, keepdims=True)).squeeze(0)
+        s1_predictions = np.argmax(s1_output, axis=1).squeeze(0)
 
         # Merge predictions: use S1 where predicted, otherwise use spine model
         # S1 model outputs: 0 (background) or 1 (S1), we map 1 -> 10

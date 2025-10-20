@@ -1,7 +1,5 @@
-torch
-torchvision
-gradio
+openvino
+gradio==5.30.0
 numpy
 pillow
 pydicom
-ultralytics
